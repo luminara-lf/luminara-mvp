@@ -35,6 +35,38 @@ for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
+# ── In-memory data store that survives browser refreshes ──────────────────────
+# A browser refresh starts a NEW Streamlit session, which wipes session_state — so
+# session_state alone cannot survive a refresh. st.cache_resource is a single,
+# process-wide object shared across all sessions: it persists the uploaded data
+# across refreshes (new sessions) yet is lost when the app process restarts
+# (Ctrl+C + rerun) — exactly the required lifetime.
+DATA_KEYS = ("events_df", "orders_df", "vendors_df", "scored_df", "files_hash")
+
+
+@st.cache_resource
+def _data_store() -> dict:
+    """Process-global store of the loaded dataframes (one per server process)."""
+    return {k: None for k in DATA_KEYS}
+
+
+def _persist_to_store() -> None:
+    """Copy the current session's dataframes into the process-global store."""
+    store = _data_store()
+    for k in DATA_KEYS:
+        store[k] = st.session_state.get(k)
+
+
+def _hydrate_from_store() -> None:
+    """On a fresh session (e.g. after a browser refresh), restore data from the store."""
+    store = _data_store()
+    for k in DATA_KEYS:
+        if st.session_state.get(k) is None and store.get(k) is not None:
+            st.session_state[k] = store[k]
+
+
+_hydrate_from_store()
+
 # ── Column name maps (solar CSV names → engine names) ─────────────────────────
 EVENTS_MAP = {"install_date": "event_date"}
 ORDERS_MAP = {
@@ -43,8 +75,19 @@ ORDERS_MAP = {
     "delivery_confirmed": "confirmed",
 }
 
+# Required columns per uploaded file (solar CSV names).
+REQUIRED_EVENT_COLS  = {"customer", "install_date", "location"}
+REQUIRED_ORDER_COLS  = {"customer", "equipment_item", "vendor", "expected_delivery_date", "delivery_confirmed"}
+REQUIRED_VENDOR_COLS = {"vendor_name", "reliability_rating"}
+
 # ── Risk score color palette ──────────────────────────────────────────────────
 SCORE_BG = {"GREEN": "#c6efce", "YELLOW": "#ffeb9c", "RED": "#ffc7ce"}
+
+# ── Pending WhatsApp update file (written by webhook.py) ───────────────────────
+# The uploaded dashboard data is held in memory only (session_state + a process-
+# global st.cache_resource store) — never written to disk. It survives browser
+# refreshes but resets when the app process restarts. See _data_store() above.
+PENDING_PATH = os.path.join(os.path.dirname(__file__), "data", "pending_updates.json")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -194,6 +237,31 @@ def recompute() -> None:
         st.session_state.vendors_df,
     )
     st.session_state.scored_df = scored
+    # recompute() is the funnel for every data change (upload, approve, manual
+    # apply) — mirror the fresh data into the refresh-surviving store.
+    _persist_to_store()
+
+
+# ── Upload ingestion (data lives in session_state + a process-global store) ───
+
+def schema_errors(events_raw, orders_raw, vendors_raw) -> list[str]:
+    """Return a list of human-readable missing-column messages (empty if valid)."""
+    msgs = []
+    miss_ev = REQUIRED_EVENT_COLS  - set(events_raw.columns)
+    miss_po = REQUIRED_ORDER_COLS  - set(orders_raw.columns)
+    miss_vn = REQUIRED_VENDOR_COLS - set(vendors_raw.columns)
+    if miss_ev: msgs.append(f"Install Schedule is missing columns: {miss_ev}")
+    if miss_po: msgs.append(f"Purchase Orders is missing columns: {miss_po}")
+    if miss_vn: msgs.append(f"Vendor List is missing columns: {miss_vn}")
+    return msgs
+
+
+def ingest_dataframes(events_raw, orders_raw, vendors_raw) -> None:
+    """Rename raw (solar) columns to engine names, store in session, and score."""
+    st.session_state.events_df  = events_raw.rename(columns=EVENTS_MAP)
+    st.session_state.orders_df  = orders_raw.rename(columns=ORDERS_MAP)
+    st.session_state.vendors_df = vendors_raw
+    recompute()
 
 
 def build_display_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -416,6 +484,257 @@ def friendly_detected_lines(ext: dict) -> list[str]:
     return parts
 
 
+# ── WhatsApp pending-update helpers ───────────────────────────────────────────
+
+def load_pending_update() -> dict | None:
+    """Read data/pending_updates.json if a WhatsApp update is awaiting review."""
+    if not os.path.exists(PENDING_PATH):
+        return None
+    try:
+        with open(PENDING_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def delete_pending_update() -> None:
+    try:
+        os.remove(PENDING_PATH)
+    except OSError:
+        pass
+
+
+# ── WhatsApp outbound notification (operator decision → original sender) ───────
+
+def _send_whatsapp(to: str, body: str) -> tuple[bool, str]:
+    """
+    Send a WhatsApp message via Twilio. Credentials are loaded from .env
+    (python-dotenv ran at startup). Returns (ok, detail) — never raises.
+    """
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token  = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_WHATSAPP_FROM")
+
+    if not (account_sid and auth_token and from_number):
+        return False, "Twilio credentials are not set in .env."
+    if not to:
+        return False, "No sender number on file for this update."
+    try:
+        from twilio.rest import Client
+        Client(account_sid, auth_token).messages.create(from_=from_number, to=to, body=body)
+        return True, to
+    except Exception as exc:  # noqa: BLE001 — a send failure must not break the dashboard
+        return False, str(exc)
+
+
+def notify_sender(pending: dict, action: str) -> tuple[bool, str]:
+    """
+    Message the original WhatsApp sender that the operator approved/rejected
+    their update. `action` is "approved" or "rejected".
+    """
+    to        = pending.get("from_number")
+    language  = pending.get("language", "en")
+    customer  = pending.get("customer") or "the customer"
+    new_date  = pending.get("new_delivery_date") or "—"
+
+    if action == "approved":
+        if language == "es":
+            body = (f"✅ Actualización aprobada por el equipo de operaciones de Luminara. "
+                    f"La fecha de entrega de {customer} ha sido actualizada al {new_date}.")
+        else:
+            body = (f"✅ Update approved by the Luminara operations team. "
+                    f"{customer}'s delivery date has been updated to {new_date}.")
+    else:  # rejected
+        if language == "es":
+            body = ("❌ Actualización rechazada por el equipo de operaciones. "
+                    "No se realizaron cambios.")
+        else:
+            body = ("❌ Update rejected by the operations team. No changes were made.")
+
+    return _send_whatsapp(to, body)
+
+
+def render_pending_banner() -> None:
+    """
+    Prominent orange banner shown at the very top whenever a WhatsApp message is
+    waiting. The operator must Approve or Reject — nothing is applied automatically.
+    """
+    pending = load_pending_update()
+    if not pending:
+        return
+
+    raw_msg   = pending.get("raw_message", "")
+    customer  = pending.get("customer") or "—"
+    equipment = pending.get("equipment") or "—"
+    new_date  = pending.get("new_delivery_date") or "—"
+    vendor    = pending.get("vendor") or "—"
+
+    st.markdown(
+        """
+        <div style="background-color:#ffedcc;border-left:8px solid #ff8c00;
+                    padding:14px 18px;border-radius:8px;margin-bottom:10px;">
+          <h3 style="margin:0;color:#7a3e00;">
+            📲 New WhatsApp Update — Pending Your Review
+          </h3>
+          <div style="color:#7a3e00;font-size:0.9rem;">
+            Nueva actualización de WhatsApp — Pendiente de su revisión
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=True):
+        st.markdown("**📨 Message received  (Mensaje recibido):**")
+        st.markdown(f"> {raw_msg}")
+
+        st.markdown("**🔎 What we extracted  (Lo que extrajimos):**")
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        ec1.markdown(f"**Customer**\n\n{customer}")
+        ec2.markdown(f"**Equipment**\n\n{equipment}")
+        ec3.markdown(f"**New delivery date**\n\n{new_date}")
+        ec4.markdown(f"**Vendor**\n\n{vendor}")
+
+        if st.session_state.scored_df is None:
+            st.info(
+                "Upload your data below to apply this update.  "
+                "(Suba sus datos abajo para aplicar esta actualización.)"
+            )
+
+        bcol1, bcol2 = st.columns(2)
+        approve = bcol1.button(
+            "✅ Approve  (Aprobar)", type="primary", use_container_width=True,
+            key="approve_pending",
+        )
+        reject = bcol2.button(
+            "❌ Reject  (Rechazar)", use_container_width=True, key="reject_pending",
+        )
+
+        if reject:
+            ok, detail = notify_sender(pending, "rejected")
+            delete_pending_update()
+            st.session_state["_pending_flash"] = ("warning", "rejected", ok, detail)
+            st.rerun()
+
+        if approve:
+            if st.session_state.scored_df is None:
+                st.warning(
+                    "Please upload your data first, then approve.  "
+                    "(Por favor suba sus datos primero, luego apruebe.)"
+                )
+            else:
+                extracted = {
+                    "customer":          pending.get("customer"),
+                    "item":              pending.get("equipment"),
+                    "vendor":            pending.get("vendor"),
+                    "new_delivery_date": pending.get("new_delivery_date"),
+                    "delivery_confirmed": False,  # WhatsApp updates are delivery-date changes
+                }
+                before = st.session_state.scored_df.copy()
+                matched_indices, _fields, _fail = find_matching_rows(
+                    extracted, st.session_state.orders_df, st.session_state.events_df
+                )
+                if not matched_indices:
+                    st.error(
+                        f"Couldn't match a purchase order for **{extracted.get('customer') or 'this message'}**. "
+                        "Check that your uploaded data matches, then Reject and re-send.\n\n"
+                        f"No se pudo encontrar una orden de compra para **{extracted.get('customer') or 'este mensaje'}**."
+                    )
+                else:
+                    records = apply_update(extracted, matched_indices)
+                    if records:
+                        recompute()
+                        enrich_with_scores(records, before)
+                        existing = st.session_state.update_result or {"changes": [], "no_matches": []}
+                        existing["changes"].extend(records)
+                        st.session_state.update_result = existing
+                    ok, detail = notify_sender(pending, "approved")
+                    delete_pending_update()
+                    st.session_state["_pending_flash"] = ("success", "approved", ok, detail)
+                    st.rerun()
+
+
+# ── Upload section (always visible at the top — replace data anytime) ─────────
+
+def render_upload_section() -> None:
+    """
+    Render the three CSV uploaders. When a NEW set of files is uploaded, replace
+    the in-memory dataframes in session_state and rerun so the risk table shows
+    the new data. Nothing is written to disk — data lives only in session_state.
+    """
+    st.subheader("Upload Your Data  (Subir Sus Datos)")
+    st.caption(
+        "Upload all three CSVs to load the dashboard. Re-upload anytime to replace "
+        "the current data.  (Suba los tres CSV para cargar el tablero. Vuelva a "
+        "subirlos para reemplazar los datos.)"
+    )
+
+    uc1, uc2, uc3 = st.columns(3)
+    with uc1:
+        schedule_file = st.file_uploader(
+            "Install Schedule  (Calendario de Instalaciones)", type="csv", key="schedule_upload"
+        )
+    with uc2:
+        po_file = st.file_uploader(
+            "Purchase Orders  (Órdenes de Compra)", type="csv", key="po_upload"
+        )
+    with uc3:
+        vendor_file = st.file_uploader(
+            "Vendor List  (Lista de Proveedores)", type="csv", key="vendor_upload"
+        )
+
+    st.divider()
+
+    if not (schedule_file and po_file and vendor_file):
+        return
+
+    new_hash = hash((
+        schedule_file.name, schedule_file.size,
+        po_file.name,       po_file.size,
+        vendor_file.name,   vendor_file.size,
+    ))
+    if st.session_state.files_hash == new_hash:
+        return  # these exact files are already loaded
+
+    try:
+        schedule_file.seek(0); po_file.seek(0); vendor_file.seek(0)
+        events_raw  = pd.read_csv(schedule_file)
+        orders_raw  = pd.read_csv(po_file)
+        vendors_raw = pd.read_csv(vendor_file)
+    except Exception as exc:
+        st.error(f"Could not read CSV files: {exc}  (No se pudieron leer los archivos CSV.)")
+        st.stop()
+
+    errors = schema_errors(events_raw, orders_raw, vendors_raw)
+    if errors:
+        st.error("\n\n".join(errors) + "\n\nDid you upload the files to the correct slots?")
+        st.stop()
+
+    # Replace the current data in session_state and rescore.
+    ingest_dataframes(events_raw, orders_raw, vendors_raw)
+    st.session_state.files_hash = new_hash
+    _persist_to_store()  # capture the new files_hash too (recompute ran before it was set)
+    st.rerun()
+
+
+# ── Background poller (timed fragment — does NOT re-render the page) ───────────
+
+@st.fragment(run_every=5)
+def pending_poller() -> None:
+    """
+    Reruns only itself every 5s. When a new WhatsApp pending_updates.json appears
+    and isn't already on screen (and the operator isn't mid-review), trigger ONE
+    full app rerun so the banner shows. Because only this fragment reruns on the
+    timer, the rest of the page is not re-executed — so the upload section renders
+    exactly once.
+    """
+    new_update_waiting = load_pending_update() is not None
+    already_shown      = bool(st.session_state.get("_banner_shown"))
+    review_in_progress = bool(st.session_state.get("pending_confirmation"))
+    if new_update_waiting and not already_shown and not review_in_progress:
+        st.rerun()
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. HEADER
 # ═════════════════════════════════════════════════════════════════════════════
@@ -423,6 +742,29 @@ def friendly_detected_lines(ext: dict) -> list[str]:
 st.title("☀️ Luminara AI")
 st.caption(f"Solar Installation Risk Intelligence  •  {date.today().strftime('%B %d, %Y')}")
 st.divider()
+
+# ── WhatsApp pending-update banner (checked on every refresh) ─────────────────
+_flash = st.session_state.pop("_pending_flash", None)
+if _flash:
+    _kind, _what, _notified, _detail = _flash
+    if _what == "approved":
+        st.success("✅ WhatsApp update approved and applied. Risk scores recalculated.  "
+                   "(Actualización de WhatsApp aprobada y aplicada.)")
+    else:
+        st.warning("❌ WhatsApp update rejected and discarded.  "
+                   "(Actualización de WhatsApp rechazada y descartada.)")
+    if _notified:
+        st.caption(f"📲 Sender notified on WhatsApp ({_detail}).")
+    else:
+        st.caption(f"⚠️ Could not notify the sender on WhatsApp: {_detail}")
+
+render_pending_banner()
+# Record whether the banner is currently on screen so the background poller knows
+# not to keep triggering reruns while the operator is acting on it.
+st.session_state["_banner_shown"] = load_pending_update() is not None
+
+# ── FILE UPLOAD — always visible at the top so data can be replaced anytime ───
+render_upload_section()
 
 has_data = st.session_state.scored_df is not None
 
@@ -681,62 +1023,17 @@ if has_data:
 else:
     st.info(
         "👋 **Welcome to Luminara AI!**\n\n"
-        "Upload your three CSV files below to see your install risk dashboard.\n\n"
+        "Upload your three CSV files above to see your install risk dashboard.\n\n"
         "---\n\n"
         "**¡Bienvenido a Luminara AI!**\n\n"
-        "Suba sus tres archivos CSV a continuación para ver el tablero de riesgos de instalaciones."
+        "Suba sus tres archivos CSV arriba para ver el tablero de riesgos de instalaciones."
     )
     st.divider()
 
 
-# ── 3. FILE UPLOAD (always visible) ──────────────────────────────────────────
-st.subheader("Upload Your Data  (Subir Sus Datos)")
-
-uc1, uc2, uc3 = st.columns(3)
-with uc1:
-    schedule_file = st.file_uploader(
-        "Install Schedule  (Calendario de Instalaciones)", type="csv", key="schedule_upload"
-    )
-with uc2:
-    po_file = st.file_uploader(
-        "Purchase Orders  (Órdenes de Compra)", type="csv", key="po_upload"
-    )
-with uc3:
-    vendor_file = st.file_uploader(
-        "Vendor List  (Lista de Proveedores)", type="csv", key="vendor_upload"
-    )
-
-if schedule_file and po_file and vendor_file:
-    _new_hash = hash((
-        schedule_file.name, schedule_file.size,
-        po_file.name,       po_file.size,
-        vendor_file.name,   vendor_file.size,
-    ))
-    if st.session_state.files_hash != _new_hash:
-        try:
-            schedule_file.seek(0); po_file.seek(0); vendor_file.seek(0)
-            _events_raw  = pd.read_csv(schedule_file)
-            _orders_raw  = pd.read_csv(po_file)
-            _vendors_raw = pd.read_csv(vendor_file)
-        except Exception as exc:
-            st.error(f"Could not read CSV files: {exc}  (No se pudieron leer los archivos CSV.)")
-            st.stop()
-
-        _miss_ev = {"customer", "install_date", "location"} - set(_events_raw.columns)
-        _miss_po = {"customer", "equipment_item", "vendor", "expected_delivery_date", "delivery_confirmed"} - set(_orders_raw.columns)
-        _miss_vn = {"vendor_name", "reliability_rating"} - set(_vendors_raw.columns)
-        if _miss_ev or _miss_po or _miss_vn:
-            msgs = []
-            if _miss_ev: msgs.append(f"Install Schedule is missing columns: {_miss_ev}")
-            if _miss_po: msgs.append(f"Purchase Orders is missing columns: {_miss_po}")
-            if _miss_vn: msgs.append(f"Vendor List is missing columns: {_miss_vn}")
-            st.error("\n\n".join(msgs) + "\n\nDid you upload the files to the correct slots?")
-            st.stop()
-
-        st.session_state.events_df  = _events_raw.rename(columns=EVENTS_MAP)
-        st.session_state.orders_df  = _orders_raw.rename(columns=ORDERS_MAP)
-        st.session_state.vendors_df = _vendors_raw
-        st.session_state.files_hash = _new_hash
-
-        recompute()
-        st.rerun()
+# ── AUTO-REFRESH — poll for new WhatsApp pending updates ──────────────────────
+# Registered last. The fragment reruns ONLY itself every few seconds (the rest of
+# the page, including the upload section, is NOT re-executed — which is what fixes
+# the duplicate-render bug). When a new pending_updates.json appears and isn't
+# already on screen, it triggers a single full rerun so the banner shows.
+pending_poller()

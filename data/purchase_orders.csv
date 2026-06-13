@@ -1,10 +1,10 @@
 customer,equipment_item,vendor,expected_delivery_date,delivery_confirmed
-Rivera Energía Solar,Solar panels 400W x12,SunTech PR,2026-06-09,no
+Rivera Energía Solar,Solar panels 400W x12,SunTech PR,2026-06-17,no
 Familia Ortiz Torres,Inverter 7kW,PowerEdge,2026-06-10,no
 Constructora del Norte,Battery storage 10kWh,VoltCore,2026-06-12,no
 López & Asociados Solar,Solar panels 300W x10,SunTech PR,2026-06-08,no
 Colmado Reyes,Mounting hardware kit,IronMount,2026-06-14,no
-Hospital San Pablo,Inverter 10kW,PowerEdge,2026-06-15,no
+Hospital San Pablo,Inverter 10kW,PowerEdge,2026-06-26,no
 Inversiones Cruz,Solar panels 400W x20,SunTech PR,2026-06-16,no
 Escuela Madre Rafols,Battery storage 15kWh,VoltCore,2026-06-18,no
 Ferretería Mendoza,Solar panels 300W x16,SunTech PR,2026-06-20,no

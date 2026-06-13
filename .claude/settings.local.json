@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(pip3 install *)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/python *)",
+      "Bash(.venv/bin/streamlit run *)",
+      "Bash(curl -s http://localhost:8502/healthz)",
+      "Bash(kill %1)",
+      "Bash(open *)",
+      "Bash(curl -s http://localhost:8501/healthz)",
+      "Bash(chmod +x run_with_whatsapp.sh)",
+      "Bash(bash -n run_with_whatsapp.sh)",
+      "Bash(sed -E 's/=.+/=<set>/; s/=$/=<empty>/' .env)",
+      "Bash(venv/bin/python -m py_compile webhook.py)",
+      "Bash(venv/bin/python -c ' *)",
+      "Bash(venv/bin/python -m py_compile app.py)",
+      "Read(//private/tmp/**)",
+      "Bash(rm -f /tmp/is.bak /tmp/po.bak /tmp/vl.bak /tmp/st_boot2.log)",
+      "Bash(pkill -f \"streamlit run app.py\")",
+      "Bash(venv/bin/python -m py_compile nl_parser.py webhook.py)",
+      "Bash(cd *)",
+      "Bash(venv/bin/python -m py_compile app.py webhook.py)",
+      "Bash(sed -n '/_DEFAULTS = {/,/^}/p' app.py)",
+      "Bash(venv/bin/python -m py_compile app.py webhook.py nl_parser.py)"
+    ]
+  }
+}
