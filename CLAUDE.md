@@ -70,13 +70,20 @@ The Streamlit interface (`app.py`) maps solar-specific column names to engine na
 
 ## Risk Scoring Logic (Rules-Based — No ML)
 
-| Score  | Condition                                                                                   |
-|--------|---------------------------------------------------------------------------------------------|
-| Green  | delivery_confirmed = "yes" OR install is 14+ days away with no confirmation issue           |
-| Yellow | delivery_confirmed = "no" AND install is 7–14 days away                                     |
-| Red    | delivery_confirmed = "no" AND (install is under 7 days away OR expected_delivery_date has passed) |
+As of Level 1 Predictive Intelligence, scoring factors in **vendor delay probability**
+alongside days-until-install. `delay_probability = 0%` when delivery is confirmed,
+otherwise `(1 - reliability_rating) × 100`. A delay probability `>= 25%`
+(`DELAY_PROB_THRESHOLD`) is "elevated" and escalates the score one level within the
+day-based bands. Missing `reliability_rating` falls back to `0.80` (`DEFAULT_RELIABILITY`).
 
-Version 1 is purely rules-based. No machine learning.
+| Score  | Condition                                                                                          |
+|--------|----------------------------------------------------------------------------------------------------|
+| Green  | delivery_confirmed = "yes"  OR  (unconfirmed AND install > 14 days away AND delay_probability < 25%) |
+| Yellow | (unconfirmed AND install > 14 days away AND delay_probability >= 25%)  OR  (unconfirmed AND install 7–14 days away AND delay_probability < 25%) |
+| Red    | (unconfirmed AND install 7–14 days away AND delay_probability >= 25%)  OR  (unconfirmed AND install under 7 days away)  OR  expected_delivery_date has passed |
+
+Version 1 remains purely rules-based and deterministic. No machine learning — the
+delay probability is a direct arithmetic function of the vendor's reliability rating.
 
 ## AI Natural Language Feature
 

@@ -14,7 +14,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(__file__))
-from engine.risk_engine import score_all, summary, upcoming
+from engine.risk_engine import score_all, summary, upcoming, DELAY_PROB_THRESHOLD
 
 load_dotenv()
 
@@ -264,10 +264,43 @@ def ingest_dataframes(events_raw, orders_raw, vendors_raw) -> None:
     recompute()
 
 
+# Text colors for the Delay Risk column.
+DELAY_TEXT_GREEN = "#1a7f37"   # confirmed → 0% ✓
+DELAY_TEXT_AMBER = "#b35900"   # elevated risk that warns (yellow)
+DELAY_TEXT_RED   = "#d1242f"   # elevated risk driving a red score
+
+
+def format_delay_risk(row) -> str:
+    """Render the delay probability cell: '0% ✓' when confirmed, else '25%'."""
+    if bool(row.get("confirmed")):
+        return "0% ✓"
+    prob = row.get("delay_probability")
+    if prob is None or pd.isna(prob):
+        return ""
+    txt = f"{float(prob):g}%"
+    # Flag probabilities derived from a missing vendor rating (default 0.80).
+    if row.get("reliability_estimated") and float(prob) > 0:
+        txt += " (est.)"
+    return txt
+
+
+def delay_risk_color(confirmed, prob, score) -> str | None:
+    """Pick the Delay Risk text color, or None for normal text."""
+    if confirmed:
+        return DELAY_TEXT_GREEN
+    if prob is None or pd.isna(prob):
+        return None
+    if float(prob) >= DELAY_PROB_THRESHOLD:
+        return DELAY_TEXT_RED if str(score).lower() == "red" else DELAY_TEXT_AMBER
+    return None  # under threshold → normal text
+
+
 def build_display_df(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["Delivery Confirmed"] = d["confirmed"].map({True: "Yes", False: "No"})
     d["Risk Score"] = d["score"].str.upper()
+    d["Delay Risk"] = d.apply(format_delay_risk, axis=1)
+    d["Reason"] = d["reason"]
     col_map = {
         "customer": "Customer",
         "location": "Location",
@@ -277,16 +310,30 @@ def build_display_df(df: pd.DataFrame) -> pd.DataFrame:
         "order_date": "Expected Delivery",
         "Delivery Confirmed": "Delivery Confirmed",
         "Risk Score": "Risk Score",
-        "reason": "Reason",
+        "Delay Risk": "Delay Risk",
+        "Reason": "Reason",
     }
     available = [c for c in col_map if c in d.columns]
     return d[available].rename(columns=col_map)
 
 
-def style_table(display_df: pd.DataFrame):
+def style_table(display_df: pd.DataFrame, source_df: pd.DataFrame):
+    """Color each row by risk score; color the Delay Risk text by probability."""
     def _highlight(row):
-        color = SCORE_BG.get(row["Risk Score"], "#ffffff")
-        return [f"background-color: {color}"] * len(row)
+        bg = SCORE_BG.get(row["Risk Score"], "#ffffff")
+        styles = [f"background-color: {bg}"] * len(row)
+        if "Delay Risk" in row.index:
+            src = source_df.loc[row.name]
+            color = delay_risk_color(
+                bool(src.get("confirmed")),
+                src.get("delay_probability"),
+                src.get("score"),
+            )
+            cell = f"background-color: {bg}"
+            if color:
+                cell += f"; color: {color}; font-weight: 600"
+            styles[row.index.get_loc("Delay Risk")] = cell
+        return styles
     return display_df.style.apply(_highlight, axis=1)
 
 
@@ -783,8 +830,14 @@ if has_data:
     # ── 2. RISK TABLE ─────────────────────────────────────────────────────────
     st.subheader("Install Risk Overview")
     st.caption("Resumen de Riesgo de Instalaciones — Próximos 30 Días")
+    _delay_help = (
+        "Probability of delay based on vendor's historical on-time delivery rate. "
+        "0% means delivery is confirmed.\n\n"
+        "Probabilidad de atraso según el historial de entregas puntuales del "
+        "proveedor. 0% significa que la entrega está confirmada."
+    )
     st.dataframe(
-        style_table(build_display_df(_window)),
+        style_table(build_display_df(_window), _window),
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -796,6 +849,7 @@ if has_data:
             "Expected Delivery": st.column_config.DateColumn("Expected Delivery", width="small"),
             "Delivery Confirmed":st.column_config.TextColumn("Delivery Confirmed", width="small"),
             "Risk Score":        st.column_config.TextColumn("Risk Score", width="small"),
+            "Delay Risk":        st.column_config.TextColumn("Delay Risk", width="small", help=_delay_help),
             "Reason":            st.column_config.TextColumn("Reason", width="large"),
         },
     )
@@ -1014,7 +1068,9 @@ if has_data:
     _export = build_display_df(upcoming(st.session_state.scored_df, days=30))
     st.download_button(
         label="⬇️  Download Risk Report  (Descargar Reporte de Riesgo)",
-        data=_export.to_csv(index=False).encode("utf-8"),
+        # utf-8-sig (BOM) so Excel renders the ✓ glyph and accented names
+        # (e.g. "Energía") correctly instead of mojibake.
+        data=_export.to_csv(index=False).encode("utf-8-sig"),
         file_name=f"luminara_risk_report_{date.today().isoformat()}.csv",
         mime="text/csv",
     )

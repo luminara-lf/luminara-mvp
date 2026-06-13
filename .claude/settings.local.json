@@ -24,7 +24,10 @@
       "Bash(cd *)",
       "Bash(venv/bin/python -m py_compile app.py webhook.py)",
       "Bash(sed -n '/_DEFAULTS = {/,/^}/p' app.py)",
-      "Bash(venv/bin/python -m py_compile app.py webhook.py nl_parser.py)"
+      "Bash(venv/bin/python -m py_compile app.py webhook.py nl_parser.py)",
+      "Bash(git stash *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
