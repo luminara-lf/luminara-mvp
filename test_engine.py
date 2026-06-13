@@ -16,6 +16,8 @@ from engine.risk_engine import (
     upcoming,
     score_event,
     compute_delay_probability,
+    vendor_scorecard,
+    vendor_level,
     DEFAULT_RELIABILITY,
 )
 
@@ -183,3 +185,121 @@ check("missing order date → reason", orphan["reason"], "Missing order or event
 check("missing order date → delay_probability is None", orphan["delay_probability"] is None, True)
 
 print(f"\nAll {passed} predictive-intelligence assertions passed.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Vendor Scorecard — per-vendor aggregation over score_all() output
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n=== Vendor Scorecard tests ===\n")
+
+sc_passed = 0
+
+
+def sc_check(label, got, expected):
+    global sc_passed
+    assert got == expected, f"FAIL [{label}]: expected {expected!r}, got {got!r}"
+    sc_passed += 1
+    print(f"  ✓ {label}")
+
+
+def build_scored(events_rows, orders_rows, vendors_rows):
+    return score_all(
+        pd.DataFrame(events_rows), pd.DataFrame(orders_rows),
+        pd.DataFrame(vendors_rows), today=T,
+    )
+
+
+# --- vendor_level() rule (RED=any red or avg>=50; YELLOW=any yellow or avg>=25) ---
+sc_check("vendor_level: any red → red", vendor_level(True, False, 0.0), "red")
+sc_check("vendor_level: avg>=50 → red", vendor_level(False, False, 50.0), "red")
+sc_check("vendor_level: any yellow → yellow", vendor_level(False, True, 0.0), "yellow")
+sc_check("vendor_level: avg>=25 → yellow", vendor_level(False, False, 25.0), "yellow")
+sc_check("vendor_level: clean → green", vendor_level(False, False, 10.0), "green")
+sc_check("vendor_level: None avg, no flags → green", vendor_level(False, False, None), "green")
+
+# --- Distinct installs, NOT raw join rows: one job, 3 items, same vendor ---
+multi = build_scored(
+    events_rows=[{"customer": "BigJob", "location": "Ponce", "event_date": days_out(20)}],
+    orders_rows=[
+        {"customer": "BigJob", "item": "Panels", "vendor": "Acme",
+         "order_date": days_out(18), "confirmed": "no"},
+        {"customer": "BigJob", "item": "Inverter", "vendor": "Acme",
+         "order_date": days_out(18), "confirmed": "no"},
+        {"customer": "BigJob", "item": "Battery", "vendor": "Acme",
+         "order_date": days_out(18), "confirmed": "no"},
+    ],
+    vendors_rows=[{"vendor_name": "Acme", "reliability_rating": 0.90}],
+)
+card = vendor_scorecard(multi)
+acme = card[card["vendor"] == "Acme"].iloc[0]
+sc_check("multi-item job → installs_affected counts 1 distinct install",
+         int(acme["installs_affected"]), 1)
+sc_check("multi-item job → unconfirmed_count counts all 3 rows",
+         int(acme["unconfirmed_count"]), 3)
+
+# --- All-confirmed vendor → avg 0%, GREEN ---
+allconf = build_scored(
+    events_rows=[{"customer": "C1", "location": "X", "event_date": days_out(20)}],
+    orders_rows=[{"customer": "C1", "item": "Panels", "vendor": "Steady",
+                  "order_date": days_out(18), "confirmed": "yes"}],
+    vendors_rows=[{"vendor_name": "Steady", "reliability_rating": 0.70}],
+)
+steady = vendor_scorecard(allconf).iloc[0]
+sc_check("all-confirmed vendor → avg delay 0%", steady["avg_delay_probability"], 0.0)
+sc_check("all-confirmed vendor → GREEN", steady["vendor_level"], "green")
+
+# --- Shaky unconfirmed vendor (0.40 reliability → 60% delay) → RED via avg ---
+shaky = build_scored(
+    events_rows=[{"customer": "C2", "location": "X", "event_date": days_out(20)}],
+    orders_rows=[{"customer": "C2", "item": "Panels", "vendor": "Risky",
+                  "order_date": days_out(18), "confirmed": "no"}],
+    vendors_rows=[{"vendor_name": "Risky", "reliability_rating": 0.40}],
+)
+risky = vendor_scorecard(shaky).iloc[0]
+sc_check("shaky vendor → avg delay 60%", risky["avg_delay_probability"], 60.0)
+sc_check("shaky vendor → RED", risky["vendor_level"], "red")
+
+# --- Missing-date-only vendor → avg None, no crash, level rests on score ---
+nodate = build_scored(
+    events_rows=[{"customer": "Orphan", "location": "X", "event_date": days_out(20)}],
+    orders_rows=[{"customer": "Nobody", "item": "Panels", "vendor": "GhostV",
+                  "order_date": days_out(18), "confirmed": "no"}],
+    vendors_rows=[{"vendor_name": "GhostV", "reliability_rating": 0.50}],
+)
+# "Orphan" has no order → its row has no vendor and is dropped; assert no crash
+card_nodate = vendor_scorecard(nodate)
+sc_check("missing-date scorecard does not crash", isinstance(card_nodate, pd.DataFrame), True)
+
+# --- Estimated-rating vendor flagged (vendor absent from vendor_list) ---
+est = build_scored(
+    events_rows=[{"customer": "C3", "location": "X", "event_date": days_out(20)}],
+    orders_rows=[{"customer": "C3", "item": "Panels", "vendor": "Unrated",
+                  "order_date": days_out(18), "confirmed": "no"}],
+    vendors_rows=[{"vendor_name": "SomeoneElse", "reliability_rating": 0.95}],
+)
+unrated = vendor_scorecard(est).iloc[0]
+sc_check("unrated vendor → reliability_estimated True",
+         bool(unrated["reliability_estimated"]), True)
+sc_check("unrated vendor → rating defaulted to 0.80",
+         unrated["reliability_rating"], DEFAULT_RELIABILITY)
+
+# --- YELLOW via the avg-delay band (25 <= avg < 50) with NO red/yellow installs ---
+#     End-to-end through vendor_scorecard(): the yellow must come from the avg
+#     clause alone, not from an any_yellow install. Hand-build a scored_df whose
+#     installs are individually GREEN but whose delay probabilities average 35%.
+avg_band = pd.DataFrame([
+    {"vendor": "AvgBand", "customer": "AB-1", "event_date": days_out(20),
+     "confirmed": False, "score": "green", "delay_probability": 30.0,
+     "reliability_rating": 0.65, "reliability_estimated": False},
+    {"vendor": "AvgBand", "customer": "AB-2", "event_date": days_out(25),
+     "confirmed": False, "score": "green", "delay_probability": 40.0,
+     "reliability_rating": 0.65, "reliability_estimated": False},
+])
+avg_row = vendor_scorecard(avg_band).iloc[0]
+sc_check("avg-band: no red and no yellow installs",
+         bool((avg_band["score"].isin(["red", "yellow"])).any()), False)
+sc_check("avg-band: avg_delay_probability is 35%", avg_row["avg_delay_probability"], 35.0)
+sc_check("avg-band: vendor_scorecard → YELLOW from avg alone", avg_row["vendor_level"], "yellow")
+
+print(f"\nAll {sc_passed} vendor-scorecard assertions passed.")

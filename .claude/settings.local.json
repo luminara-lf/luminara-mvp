@@ -27,7 +27,9 @@
       "Bash(venv/bin/python -m py_compile app.py webhook.py nl_parser.py)",
       "Bash(git stash *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "WebSearch"
     ]
   }
 }

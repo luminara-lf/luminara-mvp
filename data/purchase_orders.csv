@@ -1,10 +1,10 @@
 customer,equipment_item,vendor,expected_delivery_date,delivery_confirmed
 Rivera Energía Solar,Solar panels 400W x12,SunTech PR,2026-06-17,no
-Familia Ortiz Torres,Inverter 7kW,PowerEdge,2026-06-10,no
+Familia Ortiz Torres,Inverter 7kW,PowerEdge,2026-06-10,yes
 Constructora del Norte,Battery storage 10kWh,VoltCore,2026-06-12,no
 López & Asociados Solar,Solar panels 300W x10,SunTech PR,2026-06-08,no
-Colmado Reyes,Mounting hardware kit,IronMount,2026-06-14,no
-Hospital San Pablo,Inverter 10kW,PowerEdge,2026-06-26,no
+Colmado Reyes,Mounting hardware kit,IronMount,2026-06-14,yes
+Hospital San Pablo,Inverter 10kW,PowerEdge,2026-06-26,yes
 Inversiones Cruz,Solar panels 400W x20,SunTech PR,2026-06-16,no
 Escuela Madre Rafols,Battery storage 15kWh,VoltCore,2026-06-18,no
 Ferretería Mendoza,Solar panels 300W x16,SunTech PR,2026-06-20,no
@@ -14,3 +14,8 @@ Agro-Solar Vega Alta,Inverter 10kW,PowerEdge,2026-06-28,yes
 Clínica Salud Integral,Battery storage 15kWh,VoltCore,2026-06-30,no
 Auto Parts Jiménez,Mounting hardware kit,IronMount,2026-07-02,yes
 Playa Azul Resort,Solar panels 300W x10,SunTech PR,2026-07-05,no
+Hacienda Solar del Valle,Solar panels 400W x14,SunTech PR,2026-07-10,yes
+Cooperativa Lares,Inverter 8kW,PowerEdge,2026-07-18,yes
+Marina Fajardo,Mounting hardware kit,IronMount,2026-07-24,yes
+Escuela Técnica Caguas,Battery storage 12kWh,VoltCore,2026-07-31,yes
+Centro Médico Bayamón,Inverter 10kW,PowerEdge,2026-08-05,yes

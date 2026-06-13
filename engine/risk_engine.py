@@ -19,6 +19,8 @@ YELLOW_DAYS = 14            # confirmed required if install within this many day
 RED_DAYS = 7               # unconfirmed + within this many days → red
 DELAY_PROB_THRESHOLD = 25.0  # percent; a delay probability >= this is "elevated"
 DEFAULT_RELIABILITY = 0.80   # used when a vendor has no reliability_rating on file
+VENDOR_RED_AVG = 50.0        # vendor scorecard: avg delay probability >= this → red
+VENDOR_YELLOW_AVG = DELAY_PROB_THRESHOLD  # avg delay probability >= this → yellow
 
 
 # ── Level 1 Predictive Intelligence ────────────────────────────────────────────
@@ -180,3 +182,92 @@ def upcoming(scored: pd.DataFrame, days: int = 30, today: date | None = None) ->
     return scored[
         (scored["event_date"] >= today) & (scored["event_date"] <= cutoff)
     ].sort_values("event_date")
+
+
+def vendor_level(any_red: bool, any_yellow: bool, avg_delay: float | None) -> str:
+    """
+    Roll a vendor's tied events up into one risk level. Generic — no industry terms.
+
+    red    : any tied event is red, OR average delay probability >= VENDOR_RED_AVG
+    yellow : (not red) AND (any tied event is yellow OR avg delay >= VENDOR_YELLOW_AVG)
+    green  : otherwise
+
+    A None avg_delay (vendor has only missing-date events) contributes nothing on
+    its own — the level then rests purely on the per-event scores.
+    """
+    avg = avg_delay if avg_delay is not None else 0.0
+    if any_red or avg >= VENDOR_RED_AVG:
+        return "red"
+    if any_yellow or avg >= VENDOR_YELLOW_AVG:
+        return "yellow"
+    return "green"
+
+
+def vendor_scorecard(scored: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate a scored DataFrame into one row per vendor. Industry-agnostic:
+    consumes only the generic columns score_all() emits — never re-merges.
+
+    Returns a DataFrame (one row per vendor, sorted worst-risk first) with:
+      vendor                : vendor name
+      installs_affected     : count of DISTINCT events tied to the vendor
+                              (distinct customer + event_date — not raw join rows,
+                              so a multi-item job is not double-counted)
+      unconfirmed_count     : tied events whose delivery is not confirmed
+      avg_delay_probability : mean delay probability across tied events
+                              (NaN-safe: confirmed events count as 0%, missing-date
+                              events excluded; None if the vendor has only such rows)
+      reliability_rating    : the vendor's rating (defaulted upstream if missing)
+      reliability_estimated : True if the rating was defaulted for any tied row
+      vendor_level          : "green" | "yellow" | "red" (see vendor_level())
+    """
+    cols = ["vendor", "customer", "event_date", "confirmed", "score",
+            "delay_probability", "reliability_rating", "reliability_estimated"]
+    work = scored[[c for c in cols if c in scored.columns]].copy()
+    # Drop rows with no vendor — they cannot belong to a vendor scorecard.
+    work = work[work["vendor"].notna()]
+
+    rows = []
+    for vendor, grp in work.groupby("vendor", sort=False):
+        # Distinct events, not join rows: one job with 3 items from this vendor
+        # is 3 rows here but 1 affected install.
+        if "event_date" in grp.columns:
+            installs_affected = grp[["customer", "event_date"]].drop_duplicates().shape[0]
+        else:
+            installs_affected = grp["customer"].nunique()
+
+        unconfirmed_count = int((~grp["confirmed"].astype(bool)).sum())
+
+        # mean() skips NaN; None/missing-date probabilities never count.
+        probs = pd.to_numeric(grp["delay_probability"], errors="coerce")
+        avg_delay = round(float(probs.mean()), 1) if probs.notna().any() else None
+
+        rating = grp["reliability_rating"].dropna()
+        rating_val = float(rating.iloc[0]) if not rating.empty else DEFAULT_RELIABILITY
+        estimated = bool(grp.get("reliability_estimated", pd.Series([False])).any())
+
+        any_red = (grp["score"] == "red").any()
+        any_yellow = (grp["score"] == "yellow").any()
+
+        rows.append({
+            "vendor": vendor,
+            "installs_affected": installs_affected,
+            "unconfirmed_count": unconfirmed_count,
+            "avg_delay_probability": avg_delay,
+            "reliability_rating": rating_val,
+            "reliability_estimated": estimated,
+            "vendor_level": vendor_level(bool(any_red), bool(any_yellow), avg_delay),
+        })
+
+    result = pd.DataFrame(rows, columns=[
+        "vendor", "installs_affected", "unconfirmed_count", "avg_delay_probability",
+        "reliability_rating", "reliability_estimated", "vendor_level",
+    ])
+
+    # Sort worst-risk first, then by unconfirmed volume, for a useful default view.
+    level_rank = {"red": 0, "yellow": 1, "green": 2}
+    result["_rank"] = result["vendor_level"].map(level_rank)
+    result = result.sort_values(
+        ["_rank", "unconfirmed_count"], ascending=[True, False]
+    ).drop(columns="_rank").reset_index(drop=True)
+    return result

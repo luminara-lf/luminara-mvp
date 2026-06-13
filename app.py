@@ -14,7 +14,9 @@ import streamlit as st
 from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(__file__))
-from engine.risk_engine import score_all, summary, upcoming, DELAY_PROB_THRESHOLD
+from engine.risk_engine import (
+    score_all, summary, upcoming, vendor_scorecard, DELAY_PROB_THRESHOLD,
+)
 
 load_dotenv()
 
@@ -334,6 +336,42 @@ def style_table(display_df: pd.DataFrame, source_df: pd.DataFrame):
                 cell += f"; color: {color}; font-weight: 600"
             styles[row.index.get_loc("Delay Risk")] = cell
         return styles
+    return display_df.style.apply(_highlight, axis=1)
+
+
+def build_vendor_scorecard_df(sc: pd.DataFrame) -> pd.DataFrame:
+    """Map the engine's vendor scorecard to solar-labeled display columns."""
+    d = sc.copy()
+
+    def _avg_cell(row):
+        avg = row["avg_delay_probability"]
+        if avg is None or pd.isna(avg):
+            return "—"
+        txt = f"{float(avg):g}%"
+        return txt
+
+    def _reliability_cell(row):
+        txt = f"{round(float(row['reliability_rating']) * 100)}%"
+        if row["reliability_estimated"]:
+            txt += " (est.)"
+        return txt
+
+    out = pd.DataFrame({
+        "Vendor":            d["vendor"],
+        "Installs Affected": d["installs_affected"],
+        "Unconfirmed":       d["unconfirmed_count"],
+        "Avg Delay Risk":    d.apply(_avg_cell, axis=1),
+        "Reliability":       d.apply(_reliability_cell, axis=1),
+        "Vendor Risk":       d["vendor_level"].str.upper(),
+    })
+    return out
+
+
+def style_vendor_scorecard(display_df: pd.DataFrame):
+    """Color each scorecard row by its Vendor Risk level (reuses SCORE_BG)."""
+    def _highlight(row):
+        color = SCORE_BG.get(row["Vendor Risk"], "#ffffff")
+        return [f"background-color: {color}"] * len(row)
     return display_df.style.apply(_highlight, axis=1)
 
 
@@ -851,6 +889,33 @@ if has_data:
             "Risk Score":        st.column_config.TextColumn("Risk Score", width="small"),
             "Delay Risk":        st.column_config.TextColumn("Delay Risk", width="small", help=_delay_help),
             "Reason":            st.column_config.TextColumn("Reason", width="large"),
+        },
+    )
+
+    st.divider()
+
+    # ── 3. VENDOR SCORECARD ────────────────────────────────────────────────────
+    st.subheader("Vendor Scorecard")
+    st.caption("Tarjeta de Desempeño de Proveedores — Todas las Instalaciones")
+    _vendor_help = (
+        "Overall vendor risk rolls up every install tied to the vendor: RED if any "
+        "install is red or average delay risk is 50%+, YELLOW if any install is "
+        "yellow or average delay risk is 25%+, otherwise GREEN. Covers all installs, "
+        "not just the next 30 days.\n\n"
+        "El riesgo general del proveedor resume todas sus instalaciones."
+    )
+    _scorecard = vendor_scorecard(st.session_state.scored_df)
+    st.dataframe(
+        style_vendor_scorecard(build_vendor_scorecard_df(_scorecard)),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Vendor":            st.column_config.TextColumn("Vendor", width="medium"),
+            "Installs Affected": st.column_config.NumberColumn("Installs Affected", width="small"),
+            "Unconfirmed":       st.column_config.NumberColumn("Unconfirmed", width="small"),
+            "Avg Delay Risk":    st.column_config.TextColumn("Avg Delay Risk", width="small"),
+            "Reliability":       st.column_config.TextColumn("Reliability", width="small"),
+            "Vendor Risk":       st.column_config.TextColumn("Vendor Risk", width="small", help=_vendor_help),
         },
     )
 
